@@ -6,18 +6,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import chromadb
 from dotenv import load_dotenv
 from openai import OpenAI
 from pypdf import PdfReader
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance,
-    FieldCondition,
-    Filter,
-    MatchValue,
-    PointStruct,
-    VectorParams,
-)
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
@@ -48,9 +40,8 @@ class Settings:
     deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "sk-76c2ca549378430a8651ebc3701092be")
     deepseek_base_url: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     deepseek_chat_model: str = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-chat")
-    qdrant_url: str = os.getenv("QDRANT_URL", "")
-    qdrant_api_key: str = os.getenv("QDRANT_API_KEY", "")
-    qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "books_rag")
+    vector_db_path: str = os.getenv("VECTOR_DB_PATH", "data/chroma")
+    vector_collection: str = os.getenv("VECTOR_COLLECTION", "books_rag")
     embed_model: str = os.getenv("EMBED_MODEL", "BAAI/bge-small-zh-v1.5")
     rerank_model: str = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-base")
     chunk_size: int = int(os.getenv("CHUNK_SIZE", "400"))
@@ -69,9 +60,12 @@ class RAGPipeline:
         self.reranker = CrossEncoder(self.settings.rerank_model)
         self.vector_size = self.embedder.get_sentence_embedding_dimension()
 
-        self.qdrant = QdrantClient(
-            url=self.settings.qdrant_url,
-            api_key=self.settings.qdrant_api_key,
+        self.vector_client = chromadb.PersistentClient(
+            path=self.settings.vector_db_path,
+        )
+        self.collection = self.vector_client.get_or_create_collection(
+            name=self.settings.vector_collection,
+            metadata={"distance": "cosine"},
         )
 
         self.llm_client = OpenAI(
@@ -79,7 +73,6 @@ class RAGPipeline:
             base_url=self.settings.deepseek_base_url,
         )
 
-        self._ensure_collection()
         self._bm25_cache: list[dict] = []
         self._bm25_index: BM25Okapi | None = None
         self._last_query: str | None = None
@@ -89,20 +82,8 @@ class RAGPipeline:
         missing = []
         if not self.settings.deepseek_api_key:
             missing.append("DEEPSEEK_API_KEY")
-        if not self.settings.qdrant_url:
-            missing.append("QDRANT_URL")
-        if not self.settings.qdrant_api_key:
-            missing.append("QDRANT_API_KEY")
         if missing:
             raise ValueError(f"缺少必要环境变量: {', '.join(missing)}")
-
-    def _ensure_collection(self) -> None:
-        existing = {c.name for c in self.qdrant.get_collections().collections}
-        if self.settings.qdrant_collection not in existing:
-            self.qdrant.create_collection(
-                collection_name=self.settings.qdrant_collection,
-                vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE),
-            )
 
     @staticmethod
     def read_file(path: Path) -> str:
@@ -129,28 +110,19 @@ class RAGPipeline:
             start = end - self.settings.chunk_overlap
         return chunks
 
-    @staticmethod
-    def _source_filter(source: str) -> Filter:
-        return Filter(
-            must=[FieldCondition(key="source", match=MatchValue(value=source))],
-        )
-
     def _existing_source_hash(self, source: str) -> str | None:
-        points, _ = self.qdrant.scroll(
-            collection_name=self.settings.qdrant_collection,
-            with_payload=True,
+        result = self.collection.get(
+            where={"source": source},
+            include=["metadatas"],
             limit=1,
-            scroll_filter=self._source_filter(source),
         )
-        if not points:
+        metadatas = result.get("metadatas") or []
+        if not metadatas:
             return None
-        return points[0].payload.get("source_hash")
+        return metadatas[0].get("source_hash")
 
     def _delete_source(self, source: str) -> None:
-        self.qdrant.delete(
-            collection_name=self.settings.qdrant_collection,
-            points_selector=self._source_filter(source),
-        )
+        self.collection.delete(where={"source": source})
 
     def _invalidate_retrieval_cache(self) -> None:
         self._bm25_cache = []
@@ -175,22 +147,28 @@ class RAGPipeline:
             return f"跳过 {source}（空内容）"
 
         vectors = self.embedder.encode(chunks, normalize_embeddings=True)
-        points: list[PointStruct] = []
+        ids: list[str] = []
+        embeddings: list[list[float]] = []
+        metadatas: list[dict] = []
+        documents: list[str] = []
         for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
-            points.append(
-                PointStruct(
-                    id=_point_id(source, i),
-                    vector=vector.tolist(),
-                    payload={
-                        "source": source,
-                        "chunk_idx": i,
-                        "text": chunk,
-                        "source_hash": source_hash,
-                    },
-                )
+            ids.append(_point_id(source, i))
+            embeddings.append(vector.tolist())
+            documents.append(chunk)
+            metadatas.append(
+                {
+                    "source": source,
+                    "chunk_idx": i,
+                    "source_hash": source_hash,
+                }
             )
 
-        self.qdrant.upsert(collection_name=self.settings.qdrant_collection, points=points)
+        self.collection.upsert(
+            ids=ids,
+            embeddings=embeddings,
+            documents=documents,
+            metadatas=metadatas,
+        )
         self._invalidate_retrieval_cache()
         return f"已写入 {source}，共 {len(chunks)} 个分块"
 
@@ -212,29 +190,19 @@ class RAGPipeline:
             return
 
         records: list[dict] = []
-        next_offset = None
-        while True:
-            points, next_offset = self.qdrant.scroll(
-                collection_name=self.settings.qdrant_collection,
-                with_payload=True,
-                with_vectors=False,
-                limit=512,
-                offset=next_offset,
+        points = self.collection.get(include=["documents", "metadatas"])
+        ids = points.get("ids") or []
+        docs = points.get("documents") or []
+        metadatas = points.get("metadatas") or []
+        for pid, text, metadata in zip(ids, docs, metadatas):
+            records.append(
+                {
+                    "id": str(pid),
+                    "source": metadata.get("source"),
+                    "chunk_idx": metadata.get("chunk_idx"),
+                    "text": text or "",
+                }
             )
-            if not points:
-                break
-            for point in points:
-                text = point.payload.get("text", "")
-                records.append(
-                    {
-                        "id": str(point.id),
-                        "source": point.payload.get("source"),
-                        "chunk_idx": point.payload.get("chunk_idx"),
-                        "text": text,
-                    }
-                )
-            if next_offset is None:
-                break
 
         self._bm25_cache = records
         corpus = [_tokenize(r["text"]) for r in records]
@@ -244,23 +212,26 @@ class RAGPipeline:
         self._load_bm25_index()
         final_k = top_k or self.settings.top_k
 
-        vector_hits = self.qdrant.search(
-            collection_name=self.settings.qdrant_collection,
-            query_vector=self._query_vector(question),
-            limit=max(final_k, self.settings.vector_recall_k),
-            with_payload=True,
+        query_limit = max(final_k, self.settings.vector_recall_k)
+        vector_hits = self.collection.query(
+            query_embeddings=[self._query_vector(question)],
+            n_results=query_limit,
+            include=["documents", "metadatas", "distances"],
         )
-        vector_results = {
-            str(hit.id): {
-                "id": str(hit.id),
-                "vector_score": float(hit.score),
+        vector_results = {}
+        ids = vector_hits.get("ids", [[]])[0]
+        docs = vector_hits.get("documents", [[]])[0]
+        metadatas = vector_hits.get("metadatas", [[]])[0]
+        distances = vector_hits.get("distances", [[]])[0]
+        for pid, text, metadata, distance in zip(ids, docs, metadatas, distances):
+            vector_results[str(pid)] = {
+                "id": str(pid),
+                "vector_score": 1.0 - float(distance),
                 "bm25_score": 0.0,
-                "source": hit.payload.get("source"),
-                "chunk_idx": hit.payload.get("chunk_idx"),
-                "text": hit.payload.get("text", ""),
+                "source": metadata.get("source"),
+                "chunk_idx": metadata.get("chunk_idx"),
+                "text": text or "",
             }
-            for hit in vector_hits
-        }
 
         bm25_results: dict[str, dict] = {}
         if self._bm25_index is not None and self._bm25_cache:
@@ -315,6 +286,7 @@ class RAGPipeline:
 
         deduped.sort(key=lambda x: x["rerank_score"], reverse=True)
         return deduped[:final_k]
+
 
     def answer(self, question: str) -> str:
         contexts = self.retrieve_hybrid(question)
