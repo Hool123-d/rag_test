@@ -45,7 +45,7 @@ def _tokenize(text: str) -> list[str]:
 
 @dataclass
 class Settings:
-    deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
+    deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "sk-76c2ca549378430a8651ebc3701092be")
     deepseek_base_url: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     deepseek_chat_model: str = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-chat")
     qdrant_url: str = os.getenv("QDRANT_URL", "")
@@ -53,7 +53,7 @@ class Settings:
     qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "books_rag")
     embed_model: str = os.getenv("EMBED_MODEL", "BAAI/bge-small-zh-v1.5")
     rerank_model: str = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-base")
-    chunk_size: int = int(os.getenv("CHUNK_SIZE", "800"))
+    chunk_size: int = int(os.getenv("CHUNK_SIZE", "400"))
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "120"))
     top_k: int = int(os.getenv("TOP_K", "5"))
     vector_recall_k: int = int(os.getenv("VECTOR_RECALL_K", "30"))
